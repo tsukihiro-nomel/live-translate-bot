@@ -7,6 +7,14 @@ function int(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+
+function boundedInt(name, fallback, { min, max }) {
+  const n = int(name, fallback);
+  if (Number.isFinite(min) && n < min) return min;
+  if (Number.isFinite(max) && n > max) return max;
+  return n;
+}
+
 export const config = {
   discord: {
     token: process.env.DISCORD_TOKEN,
@@ -21,17 +29,17 @@ export const config = {
     translateFallbackModel: process.env.OPENAI_TRANSLATE_MODEL_FALLBACK || 'gpt-4.1-mini'
   },
   overlay: {
-    port: int('OVERLAY_PORT', 3000),
+    port: boundedInt('OVERLAY_PORT', 3000, { min: 1, max: 65535 }),
     token: process.env.OVERLAY_TOKEN || 'change-me'
   },
   runtime: {
     logLevel: process.env.LOG_LEVEL || 'info',
-    silenceFinalMs: int('SILENCE_FINAL_MS', 700),
-    bubbleHoldMs: int('BUBBLE_HOLD_MS', 2500),
-    bubbleRemoveMs: int('BUBBLE_REMOVE_MS', 12000),
-    interimTranslateEveryMs: int('INTERIM_TRANSLATE_EVERY_MS', 0),
-    interimSttEveryMs: int('INTERIM_STT_EVERY_MS', 2500),
-    maxPhraseSeconds: int('MAX_PHRASE_SECONDS', 25)
+    silenceFinalMs: boundedInt('SILENCE_FINAL_MS', 700, { min: 200, max: 5000 }),
+    bubbleHoldMs: boundedInt('BUBBLE_HOLD_MS', 2500, { min: 500, max: 60_000 }),
+    bubbleRemoveMs: boundedInt('BUBBLE_REMOVE_MS', 12000, { min: 1000, max: 300_000 }),
+    interimTranslateEveryMs: boundedInt('INTERIM_TRANSLATE_EVERY_MS', 0, { min: 0, max: 60_000 }),
+    interimSttEveryMs: boundedInt('INTERIM_STT_EVERY_MS', 2500, { min: 0, max: 60_000 }),
+    maxPhraseSeconds: boundedInt('MAX_PHRASE_SECONDS', 25, { min: 3, max: 120 })
   }
 };
 

@@ -30,49 +30,76 @@ export function startOverlayServer() {
   });
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws',
+    maxPayload: 16 * 1024
+  });
 
-  /** @type {Set<import('ws').WebSocket>} */
+  /** @type {Set<{ ws: import('ws').WebSocket, guildId: string | null }>} */
   const clients = new Set();
+  const connectionsPerIp = new Map();
+  const MAX_WS_PER_IP = 10;
 
   // Minimal state cache to rehydrate overlay on refresh
-  const state = {
-    speakers: new Map(), // id -> speaker
-    captions: new Map() // speakerId -> { id, text, ts }
-  };
+  const stateByGuild = new Map(); // guildId -> { speakers: Map, captions: Map }
 
-  function broadcast(obj) {
-    for (const ws of clients) jsonSend(ws, obj);
+  function ensureGuildState(guildId) {
+    const key = guildId || '__global__';
+    if (!stateByGuild.has(key)) {
+      stateByGuild.set(key, { speakers: new Map(), captions: new Map() });
+    }
+    return stateByGuild.get(key);
+  }
+
+  function broadcast(obj, guildId = null) {
+    for (const client of clients) {
+      if (client.guildId && guildId && client.guildId !== guildId) continue;
+      if (client.guildId && !guildId) continue;
+      jsonSend(client.ws, obj);
+    }
   }
 
   // Wire bus -> ws
   bus.on('speaker.update', (ev) => {
-    state.speakers.set(ev.speaker.id, ev.speaker);
-    broadcast({ type: 'speaker.update', ...ev });
+    const g = ensureGuildState(ev.guildId);
+    g.speakers.set(ev.speaker.id, ev.speaker);
+    broadcast({ type: 'speaker.update', ...ev }, ev.guildId);
   });
 
   bus.on('speaker.activity', (ev) => {
-    broadcast({ type: 'speaker.activity', ...ev });
+    broadcast({ type: 'speaker.activity', ...ev }, ev.guildId);
   });
 
   bus.on('caption.interim', (ev) => {
-    state.captions.set(ev.speaker.id, { id: ev.id, text: ev.text, ts: ev.ts });
-    broadcast({ type: 'caption.interim', ...ev });
+    const g = ensureGuildState(ev.guildId);
+    g.captions.set(ev.speaker.id, { id: ev.id, text: ev.text, ts: ev.ts });
+    broadcast({ type: 'caption.interim', ...ev }, ev.guildId);
   });
 
   bus.on('caption.final', (ev) => {
-    state.captions.set(ev.speaker.id, { id: ev.id, text: ev.text, ts: ev.ts });
-    broadcast({ type: 'caption.final', ...ev });
+    const g = ensureGuildState(ev.guildId);
+    g.captions.set(ev.speaker.id, { id: ev.id, text: ev.text, ts: ev.ts });
+    broadcast({ type: 'caption.final', ...ev }, ev.guildId);
   });
 
   bus.on('status', (ev) => {
-    broadcast({ type: 'status', ...ev });
+    broadcast({ type: 'status', ...ev }, ev.guildId);
   });
 
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get('token');
     const guildId = url.searchParams.get('guild');
+
+    const ip = req.socket.remoteAddress || 'unknown';
+    const count = (connectionsPerIp.get(ip) || 0) + 1;
+    connectionsPerIp.set(ip, count);
+    if (count > MAX_WS_PER_IP) {
+      ws.close(1013, 'Too many connections');
+      connectionsPerIp.set(ip, count - 1);
+      return;
+    }
 
     const accept = async () => {
       if (token && token === config.overlay.token) return true;
@@ -93,8 +120,10 @@ export function startOverlayServer() {
         return;
       }
 
-      clients.add(ws);
-      log.info({ clients: clients.size }, 'Overlay WS connected');
+      const guildState = ensureGuildState(guildId);
+      const clientRef = { ws, guildId: guildId || null };
+      clients.add(clientRef);
+      log.info({ clients: clients.size, guildId: guildId || null }, 'Overlay WS connected');
 
       // Initial state
       jsonSend(ws, {
@@ -104,14 +133,23 @@ export function startOverlayServer() {
           holdMs: config.runtime.bubbleHoldMs,
           removeMs: config.runtime.bubbleRemoveMs
         },
-        speakers: Array.from(state.speakers.values()),
-        captions: Array.from(state.captions.entries()).map(([speakerId, cap]) => ({ speakerId, ...cap }))
+        speakers: Array.from(guildState.speakers.values()),
+        captions: Array.from(guildState.captions.entries()).map(([speakerId, cap]) => ({ speakerId, ...cap }))
       });
 
       ws.on('close', () => {
-        clients.delete(ws);
-        log.info({ clients: clients.size }, 'Overlay WS disconnected');
+        clients.delete(clientRef);
+        const next = (connectionsPerIp.get(ip) || 1) - 1;
+        if (next <= 0) connectionsPerIp.delete(ip);
+        else connectionsPerIp.set(ip, next);
+        log.info({ clients: clients.size, guildId: guildId || null }, 'Overlay WS disconnected');
       });
+
+      ws.on('error', () => {
+        ws.close();
+      });
+    }).catch(() => {
+      ws.close(1011, 'Auth check failed');
     });
   });
 
