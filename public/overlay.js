@@ -159,22 +159,29 @@
     });
   }
 
+  let retryMs = 1000;
+
   function connect() {
     if (!token) {
       console.warn('Overlay: missing token in URL. Add ?token=...');
     }
 
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${window.location.host}/ws?token=${encodeURIComponent(token || '')}`;
+    const qs = new URLSearchParams();
+    qs.set('token', token || '');
+    if (guildFilter) qs.set('guild', guildFilter);
+    const wsUrl = `${proto}//${window.location.host}/ws?${qs.toString()}`;
     const ws = new WebSocket(wsUrl);
 
     ws.addEventListener('open', () => {
+      retryMs = 1000;
       console.log('Overlay WS connected');
     });
 
     ws.addEventListener('close', () => {
       console.log('Overlay WS disconnected; retrying...');
-      setTimeout(connect, 1000);
+      setTimeout(connect, retryMs);
+      retryMs = Math.min(10_000, retryMs * 2);
     });
 
     ws.addEventListener('message', (msg) => {

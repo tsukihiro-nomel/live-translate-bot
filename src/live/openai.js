@@ -2,6 +2,7 @@ import { config } from '../config.js';
 import { log } from '../logger.js';
 
 const API_BASE = 'https://api.openai.com/v1';
+const DEFAULT_TIMEOUT_MS = 20_000;
 
 function authHeaders() {
   return {
@@ -18,28 +19,73 @@ async function safeJson(res) {
   }
 }
 
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeoutSignal(timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  return { signal: ctrl.signal, clear: () => clearTimeout(timer) };
+}
+
+function retryableStatus(status) {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+async function fetchWithRetry(url, init, {
+  op,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  maxAttempts = 3
+} = {}) {
+  let lastErr;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const { signal, clear } = withTimeoutSignal(timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal });
+      if (res.ok || !retryableStatus(res.status) || attempt === maxAttempts) {
+        clear();
+        return res;
+      }
+
+      const backoff = Math.min(1200, 250 * 2 ** (attempt - 1));
+      clear();
+      log.warn({ op, status: res.status, attempt, backoffMs: backoff }, 'OpenAI retryable response');
+      await wait(backoff);
+    } catch (err) {
+      clear();
+      lastErr = err;
+      if (attempt === maxAttempts) throw err;
+      const backoff = Math.min(1200, 250 * 2 ** (attempt - 1));
+      log.warn({ op, attempt, backoffMs: backoff, err }, 'OpenAI request failed; retrying');
+      await wait(backoff);
+    }
+  }
+
+  throw lastErr || new Error('OpenAI fetch failed');
+}
+
 export async function transcribeWav({ wavBuffer, model, prompt, language }) {
   const form = new FormData();
   const blob = new Blob([wavBuffer], { type: 'audio/wav' });
   form.append('file', blob, 'audio.wav');
   form.append('model', model);
   form.append('response_format', 'json');
-  // Optional hints
   if (prompt) form.append('prompt', prompt);
   if (language) form.append('language', language);
 
-  const res = await fetch(`${API_BASE}/audio/transcriptions`, {
+  const res = await fetchWithRetry(`${API_BASE}/audio/transcriptions`, {
     method: 'POST',
     headers: {
       ...authHeaders()
-      // NOTE: do NOT set Content-Type manually for FormData
     },
     body: form
-  });
+  }, { op: 'stt', timeoutMs: 25_000, maxAttempts: 3 });
 
   const json = await safeJson(res);
   if (!res.ok) {
-    log.warn({ status: res.status, json }, 'STT failed');
+    log.warn({ status: res.status, body: json?.error?.message || 'stt_error' }, 'STT failed');
     throw new Error(`STT error ${res.status}`);
   }
 
@@ -97,7 +143,7 @@ export async function translateText({ text, targetLang, glossary, recentContext,
 
   input.push({ role: 'user', content: text });
 
-  const res = await fetch(`${API_BASE}/responses`, {
+  const res = await fetchWithRetry(`${API_BASE}/responses`, {
     method: 'POST',
     headers: {
       ...authHeaders(),
@@ -108,11 +154,11 @@ export async function translateText({ text, targetLang, glossary, recentContext,
       input,
       store
     })
-  });
+  }, { op: 'translate', timeoutMs: 20_000, maxAttempts: 3 });
 
   const json = await safeJson(res);
   if (!res.ok) {
-    log.warn({ status: res.status, json }, 'Translate failed');
+    log.warn({ status: res.status, body: json?.error?.message || 'translate_error' }, 'Translate failed');
     throw new Error(`Translate error ${res.status}`);
   }
 
@@ -120,16 +166,13 @@ export async function translateText({ text, targetLang, glossary, recentContext,
 }
 
 export function shouldUpgradeTranslation({ original, translated, transcriptLooksBad }) {
-  // Heuristiques cheap et efficaces.
   if (transcriptLooksBad) return true;
   if (!translated) return true;
 
-  // Si la traduction == original (souvent signe que le modèle a "pas traduit")
   const a = (original || '').trim();
   const b = (translated || '').trim();
   if (a && b && a.toLowerCase() === b.toLowerCase()) return true;
 
-  // Trop court par rapport à l'original (souvent incomplet)
   if (a.length > 30 && b.length < Math.max(6, Math.floor(a.length * 0.35))) return true;
 
   return false;

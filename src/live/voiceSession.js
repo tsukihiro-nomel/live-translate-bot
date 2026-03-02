@@ -51,11 +51,12 @@ export class VoiceSession extends EventEmitter {
 
     this._queue = Promise.resolve();
     this._utteranceSeq = 0;
+    this._stopped = false;
   }
 
   enqueue(fn) {
     this._queue = this._queue.then(fn).catch((err) => {
-      log.warn({ err }, 'Queued task failed');
+      log.warn({ err, guildId: this.guild?.id }, 'Queued task failed');
     });
     return this._queue;
   }
@@ -73,6 +74,16 @@ export class VoiceSession extends EventEmitter {
 
     c.on('stateChange', (oldState, newState) => {
       log.debug({ from: oldState.status, to: newState.status }, 'Voice state change');
+    });
+
+    c.on('error', (err) => {
+      log.warn({ err, guildId: this.guild.id }, 'Voice connection error');
+    });
+
+    c.on('stateChange', (_oldState, newState) => {
+      if (newState.status === VoiceConnectionStatus.Destroyed) {
+        void this.stop();
+      }
     });
 
     await entersState(c, VoiceConnectionStatus.Ready, 30_000);
@@ -101,6 +112,8 @@ export class VoiceSession extends EventEmitter {
   }
 
   async stop() {
+    if (this._stopped && !this.connection) return;
+    this._stopped = true;
     for (const cap of this.activeCaptures.values()) {
       cap.stop?.();
     }
@@ -145,7 +158,7 @@ export class VoiceSession extends EventEmitter {
   }
 
   async _onSpeakingStart(userId) {
-    if (!this.connection) return;
+    if (!this.connection || this._stopped) return;
 
     // Already capturing? (avoid double subscriptions)
     if (this.activeCaptures.has(userId)) return;
@@ -213,7 +226,7 @@ export class VoiceSession extends EventEmitter {
 
       // Interim STT call (queued)
       this.enqueue(async () => {
-        if (ended) return;
+        if (ended || this._stopped) return;
         const interimText = await this._sttWithFallback({ wav, prompt });
         if (!interimText) return;
 
@@ -277,6 +290,7 @@ export class VoiceSession extends EventEmitter {
       const prompt = this._makeSttPrompt(userId);
 
       this.enqueue(async () => {
+        if (this._stopped) return;
         const cfg2 = await this.getConfig();
 
         const transcript = await this._sttWithFallback({ wav, prompt });
@@ -366,11 +380,11 @@ export class VoiceSession extends EventEmitter {
     try {
       return await transcribeWav({ wavBuffer: wav, model: primary, prompt });
     } catch (e) {
-      log.warn({ err: e }, 'Primary STT failed; trying fallback');
+      log.warn({ err: e, guildId: this.guild.id }, 'Primary STT failed; trying fallback');
       try {
         return await transcribeWav({ wavBuffer: wav, model: fallback, prompt });
       } catch (e2) {
-        log.warn({ err: e2 }, 'Fallback STT failed');
+        log.warn({ err: e2, guildId: this.guild.id }, 'Fallback STT failed');
         return '';
       }
     }
@@ -393,7 +407,7 @@ export class VoiceSession extends EventEmitter {
         store: false
       });
     } catch (e) {
-      log.warn({ err: e }, 'Primary translate failed');
+      log.warn({ err: e, guildId: this.guild.id }, 'Primary translate failed');
     }
 
     const upgrade = shouldUpgradeTranslation({ original: text, translated, transcriptLooksBad });
@@ -410,7 +424,7 @@ export class VoiceSession extends EventEmitter {
       });
       return better || translated;
     } catch (e) {
-      log.warn({ err: e }, 'Fallback translate failed');
+      log.warn({ err: e, guildId: this.guild.id }, 'Fallback translate failed');
       return translated;
     }
   }
